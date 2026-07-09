@@ -32,6 +32,9 @@ const brandSchema = new Schema({
   meta_page_id: String,
   meta_page_token: String,
   meta_ig_account_id: String,
+  website_url: String,
+  onboarding_step: { type: Number, default: 1 },
+  onboarding_complete: { type: Number, default: 0 },
   active: { type: Number, default: 1 },
   created_at: { type: Date, default: Date.now }
 }, opts);

@@ -119,13 +119,17 @@ export async function deleteContent(req, res) {
 export async function getDashboardStats(req, res) {
   try {
     const userId = req.userId;
+    const { brandId } = req.query;
+
+    const base = { user_id: userId };
+    if (brandId) base.brand_id = brandId;
 
     const [totalContent, scheduled, published, engagementAgg] = await Promise.all([
-      Content.countDocuments({ user_id: userId }),
-      Content.countDocuments({ user_id: userId, status: 'scheduled' }),
-      Content.countDocuments({ user_id: userId, status: 'published' }),
+      Content.countDocuments(base),
+      Content.countDocuments({ ...base, status: 'scheduled' }),
+      Content.countDocuments({ ...base, status: 'published' }),
       Content.aggregate([
-        { $match: { user_id: userId, status: 'published' } },
+        { $match: { ...base, status: 'published' } },
         { $group: { _id: null, avg: { $avg: '$performance.engagement_rate' } } }
       ])
     ]);

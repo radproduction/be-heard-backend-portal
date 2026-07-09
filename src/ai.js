@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { randomUUID } from 'crypto';
 import { Content, Brand, GeneratedImage } from './models/index.js';
 import { generateImageDataUri } from './imagegen.js';
+import { buildBrandSystemPrompt } from './brandBrain.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -23,9 +24,17 @@ export async function generateContent(req, res) {
       colors: brand.colors || {}
     };
 
-    const systemPrompt = `You are BeHeard. Brand: ${brandData.name}, Voice: ${brandData.voice}, Audience: ${brandData.audience}. Generate 3 versions separated by ===VERSION===. ONLY content, no explanations.`;
+    // Build comprehensive system prompt from the brand profile (Brand Brain)
+    const systemPrompt = buildBrandSystemPrompt(brand) + '\n\nGenerate 3 versions separated by ===VERSION===. ONLY content, no explanations.';
 
-    const userPrompt = `Generate a ${contentType} for ${platform}. Topic: ${topic}. Tone: ${tone}. Length: ${length}.${includeHashtags ? ' Include relevant hashtags.' : ''}${cta ? ' Include a call-to-action.' : ''}`;
+    // Pull hashtags from the brand profile when available
+    const profile = (brand.content_preferences && typeof brand.content_preferences === 'object')
+      ? brand.content_preferences : {};
+    const hashtagBank = profile.hashtag_bank?.[platform?.toLowerCase()] || [];
+    const hashtagSuggestion = hashtagBank.length > 0
+      ? ` Use these hashtags when relevant: ${hashtagBank.join(', ')}.` : '';
+
+    const userPrompt = `Generate a ${contentType} for ${platform}. Topic: ${topic}. Tone: ${tone}. Length: ${length}.${includeHashtags ? ` Include relevant hashtags.${hashtagSuggestion}` : ''}${cta ? ' Include a call-to-action.' : ''}`;
 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',

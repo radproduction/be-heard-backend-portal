@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import bcryptjs from 'bcryptjs';
 import { randomUUID } from 'crypto';
-import { User } from './models/index.js';
+import { User, Brand, Content, Campaign, PRPiece, GeneratedImage } from './models/index.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'beheard-secret-key';
 
@@ -94,5 +94,23 @@ export async function getMe(req, res) {
   } catch (err) {
     console.error('Get user error:', err);
     res.status(500).json({ error: 'Failed to get user' });
+  }
+}
+
+export async function deleteAccount(req, res) {
+  try {
+    const userId = req.userId;
+    await Promise.all([
+      User.deleteOne({ id: userId }),
+      Brand.deleteMany({ user_id: userId }),
+      Content.deleteMany({ user_id: userId }),
+      Campaign.deleteMany({ user_id: userId }),
+      PRPiece.deleteMany({ user_id: userId }),
+      GeneratedImage.deleteMany({ user_id: userId })
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete account error:', err);
+    res.status(500).json({ error: 'Failed to delete account' });
   }
 }

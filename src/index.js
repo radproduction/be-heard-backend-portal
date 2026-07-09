@@ -4,8 +4,8 @@ import dotenv from 'dotenv';
 import cron from 'node-cron';
 
 import { connectDB } from './db.js';
-import { authMiddleware, signup, login, getMe } from './auth.js';
-import { createBrand, getBrands, getBrand, updateBrand } from './brands.js';
+import { authMiddleware, signup, login, getMe, deleteAccount } from './auth.js';
+import { createBrand, getBrands, getBrand, updateBrand, prefillBrand, regenerateBrandProfile } from './brands.js';
 import { generateContent, regenerateImage } from './ai.js';
 import { createContent, getContent, getContentById, updateContent, deleteContent, getDashboardStats } from './content.js';
 import { publishContent, scheduleContent, checkScheduledContent, fetchContentAnalytics } from './publishing.js';
@@ -13,6 +13,7 @@ import { generateCampaignPlan, createCampaign, getCampaigns, getCampaignById, ge
 import { generatePR, getPRPieces, getPRById, updatePR, deletePR } from './pr.js';
 import { generateCreative, getCreativeGallery, regenerateCreative, deleteCreative } from './creative.js';
 import { getAnalytics, syncAnalytics, getAnalyticsHistory } from './analytics.js';
+import { uploadMiddleware, handleUpload } from './upload.js';
 
 dotenv.config();
 
@@ -49,12 +50,18 @@ app.get('/api/health', (req, res) => {
 app.post('/api/auth/signup', signup);
 app.post('/api/auth/login', login);
 app.get('/api/auth/me', authMiddleware, getMe);
+app.delete('/api/auth/account', authMiddleware, deleteAccount);
 
 // ----- Brands -----
 app.post('/api/brands', authMiddleware, createBrand);
 app.get('/api/brands', authMiddleware, getBrands);
 app.get('/api/brands/:brandId', authMiddleware, getBrand);
 app.put('/api/brands/:brandId', authMiddleware, updateBrand);
+app.post('/api/brands/:brandId/prefill', authMiddleware, prefillBrand);
+app.post('/api/brands/:brandId/regenerate-profile', authMiddleware, regenerateBrandProfile);
+
+// Upload route (returns a base64 data URI)
+app.post('/api/upload', authMiddleware, uploadMiddleware, handleUpload);
 
 // ----- AI -----
 app.post('/api/content/generate', authMiddleware, generateContent);

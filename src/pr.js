@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { randomUUID } from 'crypto';
 import { PRPiece, Brand } from './models/index.js';
+import { buildBrandSystemPrompt } from './brandBrain.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -59,6 +60,7 @@ Then, suggest 5 media outlets that would be interested in this story. Return as 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2048,
+      system: buildBrandSystemPrompt(brand),
       messages: [{ role: 'user', content: prompt }]
     });
 

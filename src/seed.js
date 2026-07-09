@@ -11,7 +11,9 @@ async function seed() {
 
     const existing = await User.findOne({ email: 'demo@beheard.ai' }).lean();
     if (existing) {
-      console.log('✓ Demo user already exists');
+      // Ensure the demo brand is marked onboarding-complete for the new BrandGate
+      await Brand.updateMany({ user_id: existing.id }, { $set: { onboarding_complete: 1 } });
+      console.log('✓ Demo user already exists (ensured brand onboarding_complete=1)');
       await mongoose.connection.close();
       return;
     }
@@ -37,6 +39,7 @@ async function seed() {
       voice_description: 'Confident, direct, slightly witty. No jargon.',
       target_audience: 'Tech entrepreneurs 25-45',
       competitors: ['Jasper', 'Copy.ai', 'HubSpot', 'Hootsuite'],
+      onboarding_complete: 1,
       active: 1
     });
 

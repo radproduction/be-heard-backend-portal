@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { Campaign, Brand, Content } from './models/index.js';
+import { buildBrandSystemPrompt } from './brandBrain.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -60,6 +61,7 @@ Generate 10-15 content items across the campaign period. Ensure variety in platf
     const message = await anthropic.messages.create({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 4096,
+      system: buildBrandSystemPrompt(brand),
       messages: [{ role: 'user', content: prompt }]
     });
 

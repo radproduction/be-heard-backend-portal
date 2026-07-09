@@ -1,57 +1,61 @@
-import Anthropic from '@anthropic-ai/sdk';
+import fetch from 'node-fetch';
+import { Anthropic } from '@anthropic-ai/sdk';
+import { JSDOM } from 'jsdom';
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-const EMPTY_PROFILE = {
-  tone_attributes: [],
-  dos: [],
-  donts: [],
-  key_messages: [],
-  hashtag_bank: { instagram: [], facebook: [], linkedin: [] },
-  personas: [],
-  banned_words: []
-};
-
-// Lightweight HTML -> text (no jsdom dependency)
-function stripHtml(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&[a-z]+;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+const client = new Anthropic();
 
 /**
- * Scrape brand website (homepage + /about) and return cleaned text.
- * Uses the global fetch (Node 18+). Graceful failure returns null.
+ * Scrape brand website (homepage + /about) and return cleaned text
+ * @param {string} url - Website URL
+ * @returns {Promise<string|null>} Cleaned text or null if failed
  */
 export async function scrapeBrandSite(url) {
   try {
     if (!url) return null;
 
     let fullUrl = url;
-    if (!/^https?:\/\//i.test(fullUrl)) fullUrl = 'https://' + fullUrl;
+    if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
+      fullUrl = 'https://' + fullUrl;
+    }
 
-    const fetchText = async (u) => {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-      try {
-        const res = await fetch(u, { signal: controller.signal });
-        if (res.ok) return stripHtml(await res.text());
-      } catch (err) {
-        console.error('Failed to fetch', u, '-', err.message);
-      } finally {
-        clearTimeout(timeout);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    let text = '';
+
+    // Fetch homepage
+    try {
+      const res = await fetch(fullUrl, { signal: controller.signal });
+      if (res.ok) {
+        const html = await res.text();
+        const dom = new JSDOM(html);
+        text += dom.window.document.body.textContent || '';
       }
-      return '';
-    };
+    } catch (err) {
+      console.error('Failed to fetch homepage:', err.message);
+    }
 
-    let text = await fetchText(fullUrl);
-    text += '\n' + await fetchText(fullUrl.replace(/\/$/, '') + '/about');
+    // Fetch /about
+    try {
+      const aboutUrl = fullUrl.replace(/\/$/, '') + '/about';
+      const res = await fetch(aboutUrl, { signal: controller.signal });
+      if (res.ok) {
+        const html = await res.text();
+        const dom = new JSDOM(html);
+        text += '\n' + (dom.window.document.body.textContent || '');
+      }
+    } catch (err) {
+      console.error('Failed to fetch /about:', err.message);
+    }
 
-    text = text.replace(/\s+/g, ' ').trim().substring(0, 8000);
+    clearTimeout(timeout);
+
+    // Clean and cap text
+    text = text
+      .replace(/\s+/g, ' ')
+      .trim()
+      .substring(0, 8000);
+
     return text || null;
   } catch (err) {
     console.error('Brand site scraping failed:', err.message);
@@ -60,27 +64,34 @@ export async function scrapeBrandSite(url) {
 }
 
 /**
- * Pre-fill brand suggestions (voice, audience, industry) from website text.
+ * Pre-fill brand profile from website content
+ * @param {string} siteText - Scraped website text
+ * @returns {Promise<object>} Suggestions for voice, audience, industry
  */
 export async function prefillBrandProfile(siteText) {
   try {
     if (!siteText) return {};
 
-    const message = await anthropic.messages.create({
+    const message = await client.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 1024,
-      messages: [{
-        role: 'user',
-        content: `Based on this website content, suggest a brand voice description, target audience, and industry. Return ONLY valid JSON with keys: voiceDescription, targetAudience, industry.
+      messages: [
+        {
+          role: 'user',
+          content: `Based on this website content, suggest a brand voice description, target audience, and industry. Return ONLY valid JSON with keys: voiceDescription, targetAudience, industry.
 
 Website content:
 ${siteText}`
-      }]
+        }
+      ]
     });
 
-    const text = message.content[0]?.text || '';
+    const text = message.content[0].type === 'text' ? message.content[0].text : '';
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    return jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    return {};
   } catch (err) {
     console.error('Prefill failed:', err.message);
     return {};
@@ -88,27 +99,21 @@ ${siteText}`
 }
 
 /**
- * Generate a comprehensive brand profile from all collected data.
- * `brand` is a Mongo document/object; JSON fields are native (objects/arrays).
+ * Generate comprehensive brand profile from all collected data
+ * @param {object} brand - Brand record with all fields
+ * @returns {Promise<object>} Brand profile JSON
  */
 export async function generateBrandProfile(brand) {
   try {
-    const competitors = Array.isArray(brand.competitors)
-      ? JSON.stringify(brand.competitors)
-      : (brand.competitors || '[]');
-    const colors = brand.colors && typeof brand.colors === 'object'
-      ? JSON.stringify(brand.colors)
-      : (brand.colors || '{}');
-
     const profilePrompt = `You are a brand strategist. Analyze this brand data and create a comprehensive brand profile.
 
 Brand Name: ${brand.name}
 Industry: ${brand.industry || 'Not specified'}
 Voice Description: ${brand.voice_description || 'Not specified'}
 Target Audience: ${brand.target_audience || 'Not specified'}
-Competitors: ${competitors}
+Competitors: ${brand.competitors || '[]'}
 Sample Content: ${brand.sample_content || 'Not specified'}
-Colors: ${colors}
+Colors: ${brand.colors || '{}'}
 Website Content: ${brand.website_content || 'Not provided'}
 
 Generate ONLY valid JSON (no markdown, no explanation) with this exact structure:
@@ -135,18 +140,21 @@ Generate ONLY valid JSON (no markdown, no explanation) with this exact structure
 
     while (attempt < 2 && !profile) {
       try {
-        const message = await anthropic.messages.create({
+        const message = await client.messages.create({
           model: 'claude-sonnet-4-6',
           max_tokens: 2048,
-          messages: [{ role: 'user', content: profilePrompt }]
+          messages: [
+            {
+              role: 'user',
+              content: profilePrompt
+            }
+          ]
         });
 
-        const text = message.content[0]?.text || '';
+        const text = message.content[0].type === 'text' ? message.content[0].text : '';
         const jsonMatch = text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           profile = JSON.parse(jsonMatch[0]);
-        } else {
-          attempt++;
         }
       } catch (parseErr) {
         console.error(`Profile generation attempt ${attempt + 1} failed:`, parseErr.message);
@@ -154,32 +162,38 @@ Generate ONLY valid JSON (no markdown, no explanation) with this exact structure
       }
     }
 
-    return profile || EMPTY_PROFILE;
+    return profile || {
+      tone_attributes: [],
+      dos: [],
+      donts: [],
+      key_messages: [],
+      hashtag_bank: { instagram: [], facebook: [], linkedin: [] },
+      personas: [],
+      banned_words: []
+    };
   } catch (err) {
     console.error('Brand profile generation failed:', err.message);
-    return EMPTY_PROFILE;
+    return {
+      tone_attributes: [],
+      dos: [],
+      donts: [],
+      key_messages: [],
+      hashtag_bank: { instagram: [], facebook: [], linkedin: [] },
+      personas: [],
+      banned_words: []
+    };
   }
 }
 
 /**
- * Build a comprehensive system prompt from the brand profile.
- * `content_preferences` may be a native object (Mongo) or a JSON string.
+ * Build comprehensive system prompt from brand profile
+ * @param {object} brand - Brand with profile data
+ * @returns {string} System prompt for AI generation
  */
 export function buildBrandSystemPrompt(brand) {
-  let profile = {};
-  if (brand.content_preferences) {
-    if (typeof brand.content_preferences === 'string') {
-      try { profile = JSON.parse(brand.content_preferences); } catch { profile = {}; }
-    } else {
-      profile = brand.content_preferences;
-    }
-  }
+  const profile = brand.content_preferences ? JSON.parse(brand.content_preferences) : {};
 
-  const colors = brand.colors && typeof brand.colors === 'object'
-    ? JSON.stringify(brand.colors)
-    : (brand.colors || '#BFFF00 and #0a0a0a');
-
-  return `You are a content creator for ${brand.name}.
+  let prompt = `You are a content creator for ${brand.name}.
 
 Brand Voice:
 ${brand.voice_description || 'Professional and engaging'}
@@ -206,7 +220,7 @@ ${profile.personas?.map(p => `- ${p.name}: ${p.description}`).join('\n') || '- G
 
 Banned Words: ${profile.banned_words?.join(', ') || 'None'}
 
-Brand Colors: ${colors}
+Brand Colors: ${brand.colors || '#BFFF00 and #0a0a0a'}
 
 When creating content:
 1. Reflect the brand voice and tone attributes
@@ -215,4 +229,6 @@ When creating content:
 4. Incorporate key messages naturally
 5. Avoid banned words
 6. Consider the brand personas`;
+
+  return prompt;
 }

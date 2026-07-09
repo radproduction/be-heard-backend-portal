@@ -1,30 +1,36 @@
 import axios from 'axios';
-import { Content, Brand } from './models/index.js';
+import db from './db.js';
 
 const META_API_VERSION = 'v18.0';
 const META_GRAPH_URL = `https://graph.facebook.com/${META_API_VERSION}`;
-
-function firstVersion(body) {
-  if (Array.isArray(body)) return body[0];
-  return body;
-}
 
 export async function publishContent(req, res) {
   try {
     const { contentId, platform } = req.body;
     const userId = req.userId;
 
-    const content = await Content.findOne({ id: contentId, user_id: userId }).lean();
+    // Get content
+    const content = db.prepare('SELECT * FROM content WHERE id = ? AND user_id = ?').get(contentId, userId);
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
     }
 
-    const brand = await Brand.findOne({ id: content.brand_id }).lean();
+    // Get brand
+    const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(content.brand_id);
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
-    const bodyText = firstVersion(content.body);
+    // Get first version if multiple versions
+    let bodyText = content.body;
+    try {
+      const versions = JSON.parse(content.body);
+      if (Array.isArray(versions)) {
+        bodyText = versions[0];
+      }
+    } catch (e) {
+      // body is already a string
+    }
 
     if (platform === 'instagram') {
       return publishToInstagram(res, content, brand, bodyText);
@@ -49,30 +55,39 @@ async function publishToInstagram(res, content, brand, bodyText) {
       return res.status(400).json({ error: 'Image required for Instagram' });
     }
 
+    // Create media
     const publishUrl = `${META_GRAPH_URL}/${brand.meta_ig_account_id}/media`;
-    const hashtags = content.hashtags || [];
+    
+    const hashtags = JSON.parse(content.hashtags || '[]');
     const caption = `${bodyText}\n\n${hashtags.join(' ')}`;
 
     const response = await axios.post(publishUrl, {
       image_url: content.image_url,
-      caption,
+      caption: caption,
       access_token: brand.meta_page_token
     });
 
     const mediaId = response.data.id;
 
+    // Publish media
     const containerUrl = `${META_GRAPH_URL}/${brand.meta_ig_account_id}/media_publish`;
     await axios.post(containerUrl, {
       creation_id: mediaId,
       access_token: brand.meta_page_token
     });
 
-    await Content.updateOne(
-      { id: content.id },
-      { $set: { status: 'published', published_at: new Date(), meta_post_id: mediaId } }
-    );
+    // Update content
+    db.prepare(`
+      UPDATE content 
+      SET status = 'published', published_at = datetime('now'), meta_post_id = ?
+      WHERE id = ?
+    `).run(mediaId, content.id);
 
-    res.json({ success: true, platform: 'instagram', postId: mediaId });
+    res.json({
+      success: true,
+      platform: 'instagram',
+      postId: mediaId
+    });
   } catch (err) {
     console.error('Instagram publish error:', err.response?.data || err.message);
     res.status(500).json({
@@ -88,7 +103,7 @@ async function publishToFacebook(res, content, brand, bodyText) {
       return res.status(400).json({ error: 'Facebook not connected' });
     }
 
-    const hashtags = content.hashtags || [];
+    const hashtags = JSON.parse(content.hashtags || '[]');
     const message = `${bodyText}\n\n${hashtags.join(' ')}`;
 
     const postData = {
@@ -100,17 +115,24 @@ async function publishToFacebook(res, content, brand, bodyText) {
       postData.picture = content.image_url;
     }
 
+    // Publish to Facebook
     const publishUrl = `${META_GRAPH_URL}/${brand.meta_page_id}/feed`;
     const response = await axios.post(publishUrl, postData);
 
     const postId = response.data.id;
 
-    await Content.updateOne(
-      { id: content.id },
-      { $set: { status: 'published', published_at: new Date(), meta_post_id: postId } }
-    );
+    // Update content
+    db.prepare(`
+      UPDATE content 
+      SET status = 'published', published_at = datetime('now'), meta_post_id = ?
+      WHERE id = ?
+    `).run(postId, content.id);
 
-    res.json({ success: true, platform: 'facebook', postId });
+    res.json({
+      success: true,
+      platform: 'facebook',
+      postId
+    });
   } catch (err) {
     console.error('Facebook publish error:', err.response?.data || err.message);
     res.status(500).json({
@@ -125,15 +147,16 @@ export async function scheduleContent(req, res) {
     const { contentId, scheduledFor } = req.body;
     const userId = req.userId;
 
-    const content = await Content.findOne({ id: contentId, user_id: userId }).select('id').lean();
+    const content = db.prepare('SELECT id FROM content WHERE id = ? AND user_id = ?').get(contentId, userId);
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
     }
 
-    await Content.updateOne(
-      { id: contentId },
-      { $set: { status: 'scheduled', scheduled_for: scheduledFor } }
-    );
+    db.prepare(`
+      UPDATE content 
+      SET status = 'scheduled', scheduled_for = ?
+      WHERE id = ?
+    `).run(scheduledFor, contentId);
 
     res.json({ success: true, scheduledFor });
   } catch (err) {
@@ -142,26 +165,35 @@ export async function scheduleContent(req, res) {
   }
 }
 
-export async function checkScheduledContent() {
+export function checkScheduledContent() {
   try {
-    const now = new Date();
+    const now = new Date().toISOString();
+    
+    // Find scheduled content that's ready to publish
+    const scheduledContent = db.prepare(`
+      SELECT * FROM content 
+      WHERE status = 'scheduled' AND scheduled_for <= ?
+    `).all(now);
 
-    const scheduledContent = await Content.find({
-      status: 'scheduled',
-      scheduled_for: { $lte: now }
-    }).lean();
+    console.log(`Found ${scheduledContent.length} scheduled content to publish`);
 
-    if (scheduledContent.length > 0) {
-      console.log(`Found ${scheduledContent.length} scheduled content to publish`);
-    }
-
-    for (const content of scheduledContent) {
+    scheduledContent.forEach(async (content) => {
       try {
-        const brand = await Brand.findOne({ id: content.brand_id }).lean();
-        if (!brand) continue;
+        const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(content.brand_id);
+        if (!brand) return;
 
-        const bodyText = firstVersion(content.body);
+        // Get first version if multiple
+        let bodyText = content.body;
+        try {
+          const versions = JSON.parse(content.body);
+          if (Array.isArray(versions)) {
+            bodyText = versions[0];
+          }
+        } catch (e) {
+          // body is already a string
+        }
 
+        // Publish to all platforms
         if (content.platform === 'instagram' || content.platform === 'both') {
           await publishToInstagramDirect(content, brand, bodyText);
         }
@@ -171,9 +203,9 @@ export async function checkScheduledContent() {
 
         console.log(`✓ Published scheduled content: ${content.id}`);
       } catch (err) {
-        console.error(`Failed to publish scheduled content ${content.id}:`, err.message);
+        console.error(`Failed to publish scheduled content ${content.id}:`, err);
       }
-    }
+    });
   } catch (err) {
     console.error('Check scheduled content error:', err);
   }
@@ -185,12 +217,12 @@ async function publishToInstagramDirect(content, brand, bodyText) {
   }
 
   const publishUrl = `${META_GRAPH_URL}/${brand.meta_ig_account_id}/media`;
-  const hashtags = content.hashtags || [];
+  const hashtags = JSON.parse(content.hashtags || '[]');
   const caption = `${bodyText}\n\n${hashtags.join(' ')}`;
 
   const response = await axios.post(publishUrl, {
     image_url: content.image_url,
-    caption,
+    caption: caption,
     access_token: brand.meta_page_token
   });
 
@@ -202,10 +234,11 @@ async function publishToInstagramDirect(content, brand, bodyText) {
     access_token: brand.meta_page_token
   });
 
-  await Content.updateOne(
-    { id: content.id },
-    { $set: { status: 'published', published_at: new Date(), meta_post_id: mediaId } }
-  );
+  db.prepare(`
+    UPDATE content 
+    SET status = 'published', published_at = datetime('now'), meta_post_id = ?
+    WHERE id = ?
+  `).run(mediaId, content.id);
 }
 
 async function publishToFacebookDirect(content, brand, bodyText) {
@@ -213,7 +246,7 @@ async function publishToFacebookDirect(content, brand, bodyText) {
     throw new Error('Facebook not properly configured');
   }
 
-  const hashtags = content.hashtags || [];
+  const hashtags = JSON.parse(content.hashtags || '[]');
   const message = `${bodyText}\n\n${hashtags.join(' ')}`;
 
   const postData = {
@@ -230,10 +263,11 @@ async function publishToFacebookDirect(content, brand, bodyText) {
 
   const postId = response.data.id;
 
-  await Content.updateOne(
-    { id: content.id },
-    { $set: { status: 'published', published_at: new Date(), meta_post_id: postId } }
-  );
+  db.prepare(`
+    UPDATE content 
+    SET status = 'published', published_at = datetime('now'), meta_post_id = ?
+    WHERE id = ?
+  `).run(postId, content.id);
 }
 
 export async function fetchContentAnalytics(req, res) {
@@ -241,7 +275,7 @@ export async function fetchContentAnalytics(req, res) {
     const { contentId } = req.params;
     const userId = req.userId;
 
-    const content = await Content.findOne({ id: contentId, user_id: userId }).lean();
+    const content = db.prepare('SELECT * FROM content WHERE id = ? AND user_id = ?').get(contentId, userId);
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
     }
@@ -250,12 +284,13 @@ export async function fetchContentAnalytics(req, res) {
       return res.json({ performance: {} });
     }
 
-    const brand = await Brand.findOne({ id: content.brand_id }).lean();
+    const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(content.brand_id);
     if (!brand || !brand.meta_page_token) {
       return res.json({ performance: {} });
     }
 
     try {
+      // Fetch insights from Meta
       const insightsUrl = `${META_GRAPH_URL}/${content.meta_post_id}/insights`;
       const response = await axios.get(insightsUrl, {
         params: {
@@ -266,16 +301,21 @@ export async function fetchContentAnalytics(req, res) {
 
       const insights = response.data.data || [];
       const performance = {};
+
       insights.forEach(metric => {
         performance[metric.name] = metric.values[0]?.value || 0;
       });
 
-      await Content.updateOne({ id: contentId }, { $set: { performance } });
+      // Update database
+      db.prepare('UPDATE content SET performance = ? WHERE id = ?').run(
+        JSON.stringify(performance),
+        contentId
+      );
 
       res.json({ performance });
     } catch (err) {
       console.error('Fetch analytics error:', err.message);
-      res.json({ performance: content.performance || {} });
+      res.json({ performance: JSON.parse(content.performance || '{}') });
     }
   } catch (err) {
     console.error('Get analytics error:', err);

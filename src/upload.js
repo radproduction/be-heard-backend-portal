@@ -1,8 +1,29 @@
 import multer from 'multer';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
+import fs from 'fs';
 
-// Store uploads in memory and return them as base64 data URIs so the backend
-// stays stateless (works on Railway's ephemeral filesystem, consistent with
-// how generated images are handled).
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const uploadsDir = path.join(__dirname, '../uploads');
+
+// Ensure uploads directory exists
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Configure multer
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    const filename = `${randomUUID()}${ext}`;
+    cb(null, filename);
+  }
+});
+
 const fileFilter = (req, file, cb) => {
   const allowedMimes = ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml'];
   if (allowedMimes.includes(file.mimetype)) {
@@ -13,7 +34,7 @@ const fileFilter = (req, file, cb) => {
 };
 
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage,
   fileFilter,
   limits: { fileSize: 5 * 1024 * 1024 } // 5MB
 });
@@ -25,8 +46,8 @@ export function handleUpload(req, res) {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
-    const base64 = req.file.buffer.toString('base64');
-    const url = `data:${req.file.mimetype};base64,${base64}`;
+
+    const url = `/uploads/${req.file.filename}`;
     res.json({ url });
   } catch (err) {
     console.error('Upload error:', err);

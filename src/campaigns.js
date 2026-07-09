@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
-import { Campaign, Brand, Content } from './models/index.js';
+import db from './db.js';
 import { buildBrandSystemPrompt } from './brandBrain.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -10,24 +10,17 @@ export async function generateCampaignPlan(req, res) {
     const { brandId, name, objective, startDate, endDate, budget, channels, frequency } = req.body;
     const userId = req.userId;
 
-    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
+    // Get brand details
+    const brand = db.prepare('SELECT * FROM brands WHERE id = ? AND user_id = ?').get(brandId, userId);
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
-    const brandData = {
-      name: brand.name,
-      voice: brand.voice_description,
-      audience: brand.target_audience,
-      industry: brand.industry
-    };
+    // Build comprehensive system prompt from brand profile
+    const systemPrompt = buildBrandSystemPrompt(brand);
 
-    const prompt = `You are a marketing strategist for ${brandData.name}, a ${brandData.industry} brand.
-
-Brand Voice: ${brandData.voice}
-Target Audience: ${brandData.audience}
-
-Create a comprehensive ${objective} campaign plan for:
+    // Generate campaign plan via Claude
+    const prompt = `Create a comprehensive ${objective} campaign plan for:
 - Campaign Name: ${name}
 - Duration: ${startDate} to ${endDate}
 - Budget: $${budget}
@@ -59,9 +52,9 @@ Generate a JSON response with:
 Generate 10-15 content items across the campaign period. Ensure variety in platforms and content types.`;
 
     const message = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
+      model: 'claude-sonnet-4-6',
       max_tokens: 4096,
-      system: buildBrandSystemPrompt(brand),
+      system: systemPrompt,
       messages: [{ role: 'user', content: prompt }]
     });
 
@@ -85,30 +78,35 @@ Generate 10-15 content items across the campaign period. Ensure variety in platf
   }
 }
 
-export async function createCampaign(req, res) {
+export function createCampaign(req, res) {
   try {
     const { brandId, name, objective, startDate, endDate, budget, channels, frequency, strategy, key_messages, content_plan, kpis } = req.body;
     const userId = req.userId;
 
     const campaignId = randomUUID();
-
-    await Campaign.create({
-      id: campaignId,
-      brand_id: brandId,
-      user_id: userId,
+    
+    db.prepare(`
+      INSERT INTO campaigns (
+        id, brand_id, user_id, name, objective, start_date, end_date, 
+        budget, channels, frequency, strategy, key_messages, content_plan, kpis, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      campaignId,
+      brandId,
+      userId,
       name,
       objective,
-      start_date: startDate,
-      end_date: endDate,
+      startDate,
+      endDate,
       budget,
-      channels: channels || [],
+      JSON.stringify(channels),
       frequency,
       strategy,
-      key_messages: key_messages || [],
-      content_plan: content_plan || [],
-      kpis: kpis || {},
-      status: 'active'
-    });
+      JSON.stringify(key_messages),
+      JSON.stringify(content_plan),
+      JSON.stringify(kpis),
+      'active'
+    );
 
     res.json({ id: campaignId, status: 'active' });
   } catch (err) {
@@ -117,28 +115,49 @@ export async function createCampaign(req, res) {
   }
 }
 
-export async function getCampaigns(req, res) {
+export function getCampaigns(req, res) {
   try {
     const userId = req.userId;
-    const campaigns = await Campaign.find({ user_id: userId }).sort({ created_at: -1 }).lean();
-    res.json(campaigns);
+    const campaigns = db.prepare('SELECT * FROM campaigns WHERE user_id = ? ORDER BY created_at DESC').all(userId);
+
+    const parsed = campaigns.map(c => ({
+      ...c,
+      channels: JSON.parse(c.channels),
+      key_messages: JSON.parse(c.key_messages),
+      content_plan: JSON.parse(c.content_plan),
+      kpis: JSON.parse(c.kpis)
+    }));
+
+    res.json(parsed);
   } catch (err) {
     console.error('Get campaigns error:', err);
     res.status(500).json({ error: 'Failed to get campaigns' });
   }
 }
 
-export async function getCampaignById(req, res) {
+export function getCampaignById(req, res) {
   try {
     const { campaignId } = req.params;
     const userId = req.userId;
 
-    const campaign = await Campaign.findOne({ id: campaignId, user_id: userId }).lean();
+    const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND user_id = ?').get(campaignId, userId);
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found' });
     }
 
-    campaign.content = await Content.find({ campaign_id: campaignId }).lean();
+    campaign.channels = JSON.parse(campaign.channels);
+    campaign.key_messages = JSON.parse(campaign.key_messages);
+    campaign.content_plan = JSON.parse(campaign.content_plan);
+    campaign.kpis = JSON.parse(campaign.kpis);
+
+    // Get linked content
+    const content = db.prepare('SELECT * FROM content WHERE campaign_id = ?').all(campaignId);
+    campaign.content = content.map(c => ({
+      ...c,
+      body: JSON.parse(c.body),
+      hashtags: JSON.parse(c.hashtags),
+      performance: JSON.parse(c.performance)
+    }));
 
     res.json(campaign);
   } catch (err) {
@@ -152,12 +171,13 @@ export async function generateCampaignContent(req, res) {
     const { campaignId } = req.params;
     const userId = req.userId;
 
-    const campaign = await Campaign.findOne({ id: campaignId, user_id: userId }).lean();
+    const campaign = db.prepare('SELECT * FROM campaigns WHERE id = ? AND user_id = ?').get(campaignId, userId);
     if (!campaign) {
       return res.status(404).json({ error: 'Campaign not found' });
     }
 
-    const contentPlan = Array.isArray(campaign.content_plan) ? campaign.content_plan : [];
+    const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(campaign.brand_id);
+    const contentPlan = JSON.parse(campaign.content_plan);
 
     const results = [];
     let generated = 0;
@@ -165,32 +185,39 @@ export async function generateCampaignContent(req, res) {
     for (const item of contentPlan) {
       try {
         generated++;
-
+        
+        // Generate text via Claude
         const textPrompt = `Generate a ${item.type} for ${item.platform}. Topic: ${item.topic}. Brief: ${item.brief}. Generate 3 versions separated by ===VERSION===.`;
-
+        
         const textMessage = await anthropic.messages.create({
-          model: 'claude-3-5-sonnet-20241022',
+          model: 'claude-sonnet-4-6',
           max_tokens: 1024,
           messages: [{ role: 'user', content: textPrompt }]
         });
 
         const versions = textMessage.content[0].text.split('===VERSION===').map(v => v.trim()).filter(v => v);
 
+        // Create content item
         const contentId = randomUUID();
-        const scheduledFor = new Date(`${item.date}T${item.time}:00Z`);
+        const scheduledFor = new Date(`${item.date}T${item.time}:00Z`).toISOString();
 
-        await Content.create({
-          id: contentId,
-          brand_id: campaign.brand_id,
-          user_id: userId,
-          campaign_id: campaignId,
-          type: item.type,
-          platform: item.platform,
-          body: versions,
-          status: 'scheduled',
-          scheduled_for: scheduledFor,
-          media_brief: item.brief
-        });
+        db.prepare(`
+          INSERT INTO content (
+            id, brand_id, user_id, campaign_id, type, platform, body, 
+            status, scheduled_for, media_brief
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          contentId,
+          campaign.brand_id,
+          userId,
+          campaignId,
+          item.type,
+          item.platform,
+          JSON.stringify(versions),
+          'scheduled',
+          scheduledFor,
+          item.brief
+        );
 
         results.push({
           contentId,
@@ -209,7 +236,8 @@ export async function generateCampaignContent(req, res) {
       }
     }
 
-    await Campaign.updateOne({ id: campaignId }, { $set: { status: 'launched' } });
+    // Update campaign status
+    db.prepare('UPDATE campaigns SET status = ? WHERE id = ?').run('launched', campaignId);
 
     res.json({
       success: true,
@@ -223,52 +251,70 @@ export async function generateCampaignContent(req, res) {
   }
 }
 
-export async function getCalendarEvents(req, res) {
+export function getCalendarEvents(req, res) {
   try {
     const userId = req.userId;
     const { startDate, endDate } = req.query;
 
-    const filter = { user_id: userId, scheduled_for: { $ne: null } };
+    let query = `
+      SELECT c.*, b.name as brand_name 
+      FROM content c
+      JOIN brands b ON c.brand_id = b.id
+      WHERE c.user_id = ? AND c.scheduled_for IS NOT NULL
+    `;
+    const params = [userId];
+
     if (startDate && endDate) {
-      filter.scheduled_for = { $gte: new Date(startDate), $lte: new Date(endDate) };
+      query += ` AND c.scheduled_for BETWEEN ? AND ?`;
+      params.push(startDate, endDate);
     }
 
-    const events = await Content.find(filter).sort({ scheduled_for: 1 }).lean();
+    query += ` ORDER BY c.scheduled_for ASC`;
 
-    // Attach brand_name to each event
-    const brandIds = [...new Set(events.map(e => e.brand_id).filter(Boolean))];
-    const brands = await Brand.find({ id: { $in: brandIds } }).select('id name -_id').lean();
-    const brandNameById = Object.fromEntries(brands.map(b => [b.id, b.name]));
+    const events = db.prepare(query).all(...params);
 
-    const enriched = events.map(e => ({ ...e, brand_name: brandNameById[e.brand_id] || null }));
+    const parsed = events.map(e => ({
+      ...e,
+      body: JSON.parse(e.body),
+      hashtags: JSON.parse(e.hashtags)
+    }));
 
-    res.json(enriched);
+    res.json(parsed);
   } catch (err) {
     console.error('Get calendar events error:', err);
     res.status(500).json({ error: 'Failed to get calendar events' });
   }
 }
 
-export async function updateCalendarEvent(req, res) {
+export function updateCalendarEvent(req, res) {
   try {
     const { contentId } = req.params;
     const userId = req.userId;
     const { scheduledFor, status } = req.body;
 
-    const content = await Content.findOne({ id: contentId, user_id: userId }).select('id').lean();
+    const content = db.prepare('SELECT id FROM content WHERE id = ? AND user_id = ?').get(contentId, userId);
     if (!content) {
       return res.status(404).json({ error: 'Content not found' });
     }
 
-    const set = {};
-    if (scheduledFor !== undefined) set.scheduled_for = scheduledFor;
-    if (status !== undefined) set.status = status;
+    const updates = [];
+    const values = [];
 
-    if (Object.keys(set).length === 0) {
+    if (scheduledFor !== undefined) {
+      updates.push('scheduled_for = ?');
+      values.push(scheduledFor);
+    }
+    if (status !== undefined) {
+      updates.push('status = ?');
+      values.push(status);
+    }
+
+    if (updates.length === 0) {
       return res.json({ id: contentId });
     }
 
-    await Content.updateOne({ id: contentId }, { $set: set });
+    values.push(contentId);
+    db.prepare(`UPDATE content SET ${updates.join(', ')} WHERE id = ?`).run(...values);
 
     res.json({ id: contentId });
   } catch (err) {

@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import bcryptjs from 'bcryptjs';
 import { randomUUID } from 'crypto';
-import db from './db.js';
+import { User, Brand, Content, Campaign, PRPiece, GeneratedImage } from './models/index.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'beheard-secret-key';
 
@@ -19,7 +19,7 @@ export function verifyToken(token) {
 
 export function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
-  
+
   if (!token) {
     return res.status(401).json({ error: 'No token provided' });
   }
@@ -37,8 +37,7 @@ export async function signup(req, res) {
   try {
     const { email, name, password } = req.body;
 
-    // Check if user exists
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    const existing = await User.findOne({ email }).lean();
     if (existing) {
       return res.status(400).json({ error: 'Email already exists' });
     }
@@ -46,10 +45,12 @@ export async function signup(req, res) {
     const userId = randomUUID();
     const passwordHash = await bcryptjs.hash(password, 10);
 
-    db.prepare(`
-      INSERT INTO users (id, email, name, password_hash)
-      VALUES (?, ?, ?, ?)
-    `).run(userId, email, name, passwordHash);
+    await User.create({
+      id: userId,
+      email,
+      name,
+      password_hash: passwordHash
+    });
 
     const token = generateToken(userId);
     res.json({ token, userId, email, name });
@@ -63,7 +64,7 @@ export async function login(req, res) {
   try {
     const { email, password } = req.body;
 
-    const user = db.prepare('SELECT id, password_hash, name FROM users WHERE email = ?').get(email);
+    const user = await User.findOne({ email }).lean();
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -81,9 +82,11 @@ export async function login(req, res) {
   }
 }
 
-export function getMe(req, res) {
+export async function getMe(req, res) {
   try {
-    const user = db.prepare('SELECT id, email, name, company_name, plan, onboarding_complete FROM users WHERE id = ?').get(req.userId);
+    const user = await User.findOne({ id: req.userId })
+      .select('id email name company_name plan onboarding_complete -_id')
+      .lean();
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -91,5 +94,23 @@ export function getMe(req, res) {
   } catch (err) {
     console.error('Get user error:', err);
     res.status(500).json({ error: 'Failed to get user' });
+  }
+}
+
+export async function deleteAccount(req, res) {
+  try {
+    const userId = req.userId;
+    await Promise.all([
+      User.deleteOne({ id: userId }),
+      Brand.deleteMany({ user_id: userId }),
+      Content.deleteMany({ user_id: userId }),
+      Campaign.deleteMany({ user_id: userId }),
+      PRPiece.deleteMany({ user_id: userId }),
+      GeneratedImage.deleteMany({ user_id: userId })
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete account error:', err);
+    res.status(500).json({ error: 'Failed to delete account' });
   }
 }

@@ -1,51 +1,53 @@
+import 'dotenv/config';
 import bcryptjs from 'bcryptjs';
 import { randomUUID } from 'crypto';
-import db from './db.js';
-import { initializeDatabase } from './db.js';
+import mongoose from 'mongoose';
+import { connectDB } from './db.js';
+import { User, Brand } from './models/index.js';
 
 async function seed() {
   try {
-    initializeDatabase();
+    await connectDB();
 
-    // Check if demo user exists
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get('demo@beheard.ai');
+    const existing = await User.findOne({ email: 'demo@beheard.ai' }).lean();
     if (existing) {
-      console.log('✓ Demo user already exists');
+      // Ensure the demo brand is marked onboarding-complete for the new BrandGate
+      await Brand.updateMany({ user_id: existing.id }, { $set: { onboarding_complete: 1 } });
+      console.log('✓ Demo user already exists (ensured brand onboarding_complete=1)');
+      await mongoose.connection.close();
       return;
     }
 
-    // Create demo user
     const userId = randomUUID();
     const passwordHash = await bcryptjs.hash('demo123', 10);
 
-    db.prepare(`
-      INSERT INTO users (id, email, name, password_hash, company_name, onboarding_complete)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(userId, 'demo@beheard.ai', 'Demo User', passwordHash, 'Demo Company', 1);
+    await User.create({
+      id: userId,
+      email: 'demo@beheard.ai',
+      name: 'Demo User',
+      password_hash: passwordHash,
+      company_name: 'Demo Company',
+      onboarding_complete: 1
+    });
 
-    // Create demo brand
-    const brandId = randomUUID();
-    db.prepare(`
-      INSERT INTO brands (
-        id, user_id, name, industry, colors, voice_description, 
-        target_audience, competitors, active, onboarding_complete
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      brandId,
-      userId,
-      'Heard',
-      'Technology',
-      JSON.stringify({ primary: '#BFFF00', secondary: '#0a0a0a' }),
-      'Confident, direct, slightly witty. No jargon.',
-      'Tech entrepreneurs 25-45',
-      JSON.stringify(['Jasper', 'Copy.ai', 'HubSpot', 'Hootsuite']),
-      1,
-      1
-    );
+    await Brand.create({
+      id: randomUUID(),
+      user_id: userId,
+      name: 'Heard',
+      industry: 'Technology',
+      colors: { primary: '#BFFF00', secondary: '#0a0a0a' },
+      voice_description: 'Confident, direct, slightly witty. No jargon.',
+      target_audience: 'Tech entrepreneurs 25-45',
+      competitors: ['Jasper', 'Copy.ai', 'HubSpot', 'Hootsuite'],
+      onboarding_complete: 1,
+      active: 1
+    });
 
     console.log('✓ Seed data created');
     console.log('  Demo user: demo@beheard.ai / demo123');
     console.log('  Demo brand: Heard');
+
+    await mongoose.connection.close();
   } catch (err) {
     console.error('Seed error:', err);
     process.exit(1);

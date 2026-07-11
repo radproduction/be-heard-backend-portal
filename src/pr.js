@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { randomUUID } from 'crypto';
-import db from './db.js';
+import { PRPiece, Brand } from './models/index.js';
 import { buildBrandSystemPrompt } from './brandBrain.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -22,17 +22,20 @@ export async function generatePR(req, res) {
       return res.status(400).json({ error: 'Invalid PR type' });
     }
 
-    // Get brand
-    const brand = db.prepare('SELECT * FROM brands WHERE id = ? AND user_id = ?').get(brandId, userId);
+    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
-    // Build comprehensive system prompt from brand profile
-    const systemPrompt = buildBrandSystemPrompt(brand) + '\n\nYou are a professional PR writer.';
+    const brandData = {
+      name: brand.name,
+      voice: brand.voice_description,
+      industry: brand.industry
+    };
 
-    // Generate PR via Claude
-    const prompt = `Generate a professional ${PR_TYPES[type]} about:
+    const prompt = `You are a professional PR writer for ${brandData.name}, a ${brandData.industry} company with this voice: ${brandData.voice}.
+
+Generate a professional ${PR_TYPES[type]} about:
 Topic: ${topic}
 Key Facts: ${keyFacts}
 Spokesperson: ${spokesperson}
@@ -57,7 +60,7 @@ Then, suggest 5 media outlets that would be interested in this story. Return as 
     const message = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 2048,
-      system: systemPrompt,
+      system: buildBrandSystemPrompt(brand),
       messages: [{ role: 'user', content: prompt }]
     });
 
@@ -72,22 +75,17 @@ Then, suggest 5 media outlets that would be interested in this story. Return as 
       };
     }
 
-    // Save to database
     const prId = randomUUID();
-    db.prepare(`
-      INSERT INTO pr_pieces (
-        id, brand_id, user_id, type, title, body, target_outlets, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      prId,
-      brandId,
-      userId,
+    await PRPiece.create({
+      id: prId,
+      brand_id: brandId,
+      user_id: userId,
       type,
-      topic,
-      result.content,
-      JSON.stringify(result.outlets || []),
-      'draft'
-    );
+      title: topic,
+      body: result.content,
+      target_outlets: result.outlets || [],
+      status: 'draft'
+    });
 
     res.json({
       id: prId,
@@ -102,50 +100,33 @@ Then, suggest 5 media outlets that would be interested in this story. Return as 
   }
 }
 
-export function getPRPieces(req, res) {
+export async function getPRPieces(req, res) {
   try {
     const userId = req.userId;
     const { type, status } = req.query;
 
-    let query = 'SELECT * FROM pr_pieces WHERE user_id = ?';
-    const params = [userId];
+    const filter = { user_id: userId };
+    if (type) filter.type = type;
+    if (status) filter.status = status;
 
-    if (type) {
-      query += ' AND type = ?';
-      params.push(type);
-    }
-    if (status) {
-      query += ' AND status = ?';
-      params.push(status);
-    }
-
-    query += ' ORDER BY created_at DESC';
-
-    const pieces = db.prepare(query).all(...params);
-
-    const parsed = pieces.map(p => ({
-      ...p,
-      target_outlets: JSON.parse(p.target_outlets)
-    }));
-
-    res.json(parsed);
+    const pieces = await PRPiece.find(filter).sort({ created_at: -1 }).lean();
+    res.json(pieces);
   } catch (err) {
     console.error('Get PR pieces error:', err);
     res.status(500).json({ error: 'Failed to get PR pieces' });
   }
 }
 
-export function getPRById(req, res) {
+export async function getPRById(req, res) {
   try {
     const { prId } = req.params;
     const userId = req.userId;
 
-    const pr = db.prepare('SELECT * FROM pr_pieces WHERE id = ? AND user_id = ?').get(prId, userId);
+    const pr = await PRPiece.findOne({ id: prId, user_id: userId }).lean();
     if (!pr) {
       return res.status(404).json({ error: 'PR piece not found' });
     }
 
-    pr.target_outlets = JSON.parse(pr.target_outlets);
     res.json(pr);
   } catch (err) {
     console.error('Get PR error:', err);
@@ -153,35 +134,26 @@ export function getPRById(req, res) {
   }
 }
 
-export function updatePR(req, res) {
+export async function updatePR(req, res) {
   try {
     const { prId } = req.params;
     const userId = req.userId;
     const { body, status } = req.body;
 
-    const pr = db.prepare('SELECT id FROM pr_pieces WHERE id = ? AND user_id = ?').get(prId, userId);
+    const pr = await PRPiece.findOne({ id: prId, user_id: userId }).select('id').lean();
     if (!pr) {
       return res.status(404).json({ error: 'PR piece not found' });
     }
 
-    const updates = [];
-    const values = [];
+    const set = {};
+    if (body !== undefined) set.body = body;
+    if (status !== undefined) set.status = status;
 
-    if (body !== undefined) {
-      updates.push('body = ?');
-      values.push(body);
-    }
-    if (status !== undefined) {
-      updates.push('status = ?');
-      values.push(status);
-    }
-
-    if (updates.length === 0) {
+    if (Object.keys(set).length === 0) {
       return res.json({ id: prId });
     }
 
-    values.push(prId);
-    db.prepare(`UPDATE pr_pieces SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await PRPiece.updateOne({ id: prId }, { $set: set });
 
     res.json({ id: prId });
   } catch (err) {
@@ -190,17 +162,17 @@ export function updatePR(req, res) {
   }
 }
 
-export function deletePR(req, res) {
+export async function deletePR(req, res) {
   try {
     const { prId } = req.params;
     const userId = req.userId;
 
-    const pr = db.prepare('SELECT id FROM pr_pieces WHERE id = ? AND user_id = ?').get(prId, userId);
+    const pr = await PRPiece.findOne({ id: prId, user_id: userId }).select('id').lean();
     if (!pr) {
       return res.status(404).json({ error: 'PR piece not found' });
     }
 
-    db.prepare('DELETE FROM pr_pieces WHERE id = ?').run(prId);
+    await PRPiece.deleteOne({ id: prId });
     res.json({ success: true });
   } catch (err) {
     console.error('Delete PR error:', err);

@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { randomUUID } from 'crypto';
-import db from './db.js';
+import { Analytics, Brand, Content } from './models/index.js';
 
 const META_GRAPH_URL = 'https://graph.facebook.com/v18.0';
 
@@ -9,13 +9,11 @@ export async function getAnalytics(req, res) {
     const userId = req.userId;
     const { brandId, dateRange } = req.query;
 
-    // Get brand
-    const brand = db.prepare('SELECT * FROM brands WHERE id = ? AND user_id = ?').get(brandId, userId);
+    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
-    // Check if Meta connected
     if (!brand.meta_page_id || !brand.meta_page_token) {
       return res.json({
         connected: false,
@@ -23,12 +21,10 @@ export async function getAnalytics(req, res) {
       });
     }
 
-    // Calculate date range
     const days = parseInt(dateRange) || 7;
     const endDate = new Date();
     const startDate = new Date(endDate.getTime() - days * 24 * 60 * 60 * 1000);
 
-    // Fetch page insights
     let pageInsights = {};
     try {
       const pageRes = await axios.get(
@@ -51,7 +47,6 @@ export async function getAnalytics(req, res) {
       console.warn('Failed to fetch page insights:', err.message);
     }
 
-    // Fetch IG insights if connected
     let igInsights = {};
     if (brand.meta_ig_account_id) {
       try {
@@ -76,39 +71,32 @@ export async function getAnalytics(req, res) {
       }
     }
 
-    // Get content performance
-    const contentMetrics = db.prepare(`
-      SELECT 
-        platform,
-        COUNT(*) as total_posts,
-        AVG(CAST(json_extract(performance, '$.engagement') AS FLOAT)) as avg_engagement,
-        AVG(CAST(json_extract(performance, '$.impressions') AS FLOAT)) as avg_impressions,
-        AVG(CAST(json_extract(performance, '$.reach') AS FLOAT)) as avg_reach
-      FROM content
-      WHERE brand_id = ? AND status = 'published' AND published_at >= ?
-      GROUP BY platform
-    `).all(brandId, startDate.toISOString());
+    // Content performance grouped by platform
+    const contentMetrics = await Content.aggregate([
+      { $match: { brand_id: brandId, status: 'published', published_at: { $gte: startDate } } },
+      {
+        $group: {
+          _id: '$platform',
+          total_posts: { $sum: 1 },
+          avg_engagement: { $avg: '$performance.engagement' },
+          avg_impressions: { $avg: '$performance.impressions' },
+          avg_reach: { $avg: '$performance.reach' }
+        }
+      }
+    ]);
 
-    // Get top posts
-    const topPosts = db.prepare(`
-      SELECT 
-        id, title, platform, body,
-        json_extract(performance, '$.engagement') as engagement,
-        json_extract(performance, '$.impressions') as impressions,
-        published_at
-      FROM content
-      WHERE brand_id = ? AND status = 'published'
-      ORDER BY json_extract(performance, '$.engagement') DESC
-      LIMIT 5
-    `).all(brandId);
+    // Top posts by engagement
+    const topPosts = await Content.find({ brand_id: brandId, status: 'published' })
+      .sort({ 'performance.engagement': -1 })
+      .limit(5)
+      .lean();
 
-    // Store analytics
-    const analyticsId = randomUUID();
-    db.prepare(`
-      INSERT INTO analytics (
-        id, brand_id, metric_name, metric_value
-      ) VALUES (?, ?, ?, ?)
-    `).run(analyticsId, brandId, 'sync_timestamp', Date.now());
+    await Analytics.create({
+      id: randomUUID(),
+      brand_id: brandId,
+      metric_name: 'sync_timestamp',
+      metric_value: Date.now()
+    });
 
     res.json({
       connected: true,
@@ -117,7 +105,7 @@ export async function getAnalytics(req, res) {
       pageInsights,
       igInsights,
       contentMetrics: contentMetrics.map(m => ({
-        platform: m.platform,
+        platform: m._id,
         total_posts: m.total_posts,
         avg_engagement: Math.round(m.avg_engagement || 0),
         avg_impressions: Math.round(m.avg_impressions || 0),
@@ -126,8 +114,8 @@ export async function getAnalytics(req, res) {
       topPosts: topPosts.map(p => ({
         id: p.id,
         platform: p.platform,
-        engagement: p.engagement || 0,
-        impressions: p.impressions || 0,
+        engagement: p.performance?.engagement || 0,
+        impressions: p.performance?.impressions || 0,
         published_at: p.published_at
       })),
       fetchedAt: new Date().toISOString()
@@ -143,8 +131,7 @@ export async function syncAnalytics(req, res) {
     const userId = req.userId;
     const { brandId } = req.body;
 
-    // Get brand
-    const brand = db.prepare('SELECT * FROM brands WHERE id = ? AND user_id = ?').get(brandId, userId);
+    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
@@ -155,7 +142,6 @@ export async function syncAnalytics(req, res) {
 
     let synced = 0;
 
-    // Sync page insights
     try {
       const pageRes = await axios.get(
         `${META_GRAPH_URL}/${brand.meta_page_id}/insights`,
@@ -168,25 +154,19 @@ export async function syncAnalytics(req, res) {
         }
       );
 
-      pageRes.data.data?.forEach(metric => {
-        const analyticsId = randomUUID();
-        db.prepare(`
-          INSERT INTO analytics (
-            id, brand_id, metric_name, metric_value
-          ) VALUES (?, ?, ?, ?)
-        `).run(
-          analyticsId,
-          brandId,
-          `page_${metric.name}`,
-          metric.values?.[0]?.value || 0
-        );
+      for (const metric of pageRes.data.data || []) {
+        await Analytics.create({
+          id: randomUUID(),
+          brand_id: brandId,
+          metric_name: `page_${metric.name}`,
+          metric_value: metric.values?.[0]?.value || 0
+        });
         synced++;
-      });
+      }
     } catch (err) {
       console.warn('Failed to sync page insights:', err.message);
     }
 
-    // Sync IG insights
     if (brand.meta_ig_account_id) {
       try {
         const igRes = await axios.get(
@@ -200,30 +180,26 @@ export async function syncAnalytics(req, res) {
           }
         );
 
-        igRes.data.data?.forEach(metric => {
-          const analyticsId = randomUUID();
-          db.prepare(`
-            INSERT INTO analytics (
-              id, brand_id, metric_name, metric_value
-            ) VALUES (?, ?, ?, ?)
-          `).run(
-            analyticsId,
-            brandId,
-            `ig_${metric.name}`,
-            metric.values?.[0]?.value || 0
-          );
+        for (const metric of igRes.data.data || []) {
+          await Analytics.create({
+            id: randomUUID(),
+            brand_id: brandId,
+            metric_name: `ig_${metric.name}`,
+            metric_value: metric.values?.[0]?.value || 0
+          });
           synced++;
-        });
+        }
       } catch (err) {
         console.warn('Failed to sync IG insights:', err.message);
       }
     }
 
-    // Sync per-post insights
-    const publishedContent = db.prepare(`
-      SELECT id, meta_post_id, platform FROM content
-      WHERE brand_id = ? AND status = 'published' AND meta_post_id IS NOT NULL
-    `).all(brandId);
+    // Per-post insights
+    const publishedContent = await Content.find({
+      brand_id: brandId,
+      status: 'published',
+      meta_post_id: { $ne: null }
+    }).select('id meta_post_id platform -_id').lean();
 
     for (const content of publishedContent) {
       try {
@@ -242,10 +218,7 @@ export async function syncAnalytics(req, res) {
           performance[metric.name] = metric.values?.[0]?.value || 0;
         });
 
-        db.prepare(`
-          UPDATE content SET performance = ? WHERE id = ?
-        `).run(JSON.stringify(performance), content.id);
-
+        await Content.updateOne({ id: content.id }, { $set: { performance } });
         synced++;
       } catch (err) {
         console.warn(`Failed to sync post ${content.meta_post_id}:`, err.message);
@@ -264,26 +237,19 @@ export async function syncAnalytics(req, res) {
   }
 }
 
-export function getAnalyticsHistory(req, res) {
+export async function getAnalyticsHistory(req, res) {
   try {
-    const userId = req.userId;
     const { brandId, metric } = req.query;
 
-    let query = `
-      SELECT metric_name, metric_value, recorded_at
-      FROM analytics
-      WHERE brand_id = ?
-    `;
-    const params = [brandId];
+    const filter = { brand_id: brandId };
+    if (metric) filter.metric_name = new RegExp(metric, 'i');
 
-    if (metric) {
-      query += ' AND metric_name LIKE ?';
-      params.push(`%${metric}%`);
-    }
+    const history = await Analytics.find(filter)
+      .sort({ recorded_at: -1 })
+      .limit(100)
+      .select('metric_name metric_value recorded_at -_id')
+      .lean();
 
-    query += ' ORDER BY recorded_at DESC LIMIT 100';
-
-    const history = db.prepare(query).all(...params);
     res.json(history);
   } catch (err) {
     console.error('Get analytics history error:', err);

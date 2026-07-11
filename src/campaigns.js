@@ -56,12 +56,11 @@ Generate a JSON response with:
   }
 }
 
-Generate 10-15 content items across the campaign period. Ensure variety in platforms and content types.`;
+Generate exactly 5 content items across the campaign period. Ensure variety in platforms and content types. Keep each brief to one short sentence. Return ONLY the JSON object, no markdown fences or extra text.`;
 
     const message = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 4096,
-      system: buildBrandSystemPrompt(brand),
+      model: 'claude-sonnet-4-6',
+      max_tokens: 6000,
       messages: [{ role: 'user', content: prompt }]
     });
 
@@ -169,7 +168,7 @@ export async function generateCampaignContent(req, res) {
         const textPrompt = `Generate a ${item.type} for ${item.platform}. Topic: ${item.topic}. Brief: ${item.brief}. Generate 3 versions separated by ===VERSION===.`;
 
         const textMessage = await anthropic.messages.create({
-          model: 'claude-3-5-sonnet-20241022',
+          model: 'claude-sonnet-4-6',
           max_tokens: 1024,
           messages: [{ role: 'user', content: textPrompt }]
         });

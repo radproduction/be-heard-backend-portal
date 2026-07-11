@@ -28,20 +28,20 @@ export async function generateImageDataUri(prompt) {
     return null;
   };
 
-  // Primary: Gemini flash image generation
+  // Primary: Gemini 2.5 Flash Image (aka "Nano Banana", GA)
   try {
-    const dataUri = await tryModel('gemini-2.0-flash-exp', true);
+    const dataUri = await tryModel('gemini-2.5-flash-image', true);
     if (dataUri) return dataUri;
   } catch (err) {
-    console.warn('Gemini image generation failed, trying Imagen:', err.message);
+    console.warn('gemini-2.5-flash-image failed, trying gemini-3.1-flash-image:', err.message);
   }
 
-  // Fallback: Imagen
+  // Fallback: Gemini 3.1 Flash Image
   try {
-    const dataUri = await tryModel('imagen-3.0-generate-002', false);
+    const dataUri = await tryModel('gemini-3.1-flash-image', true);
     if (dataUri) return dataUri;
   } catch (err) {
-    console.error('Imagen image generation failed:', err.message);
+    console.error('gemini-3.1-flash-image failed:', err.message);
   }
 
   return null;

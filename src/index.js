@@ -14,6 +14,7 @@ import { generatePR, getPRPieces, getPRById, updatePR, deletePR } from './pr.js'
 import { generateCreative, getCreativeGallery, regenerateCreative, deleteCreative } from './creative.js';
 import { getAnalytics, syncAnalytics, getAnalyticsHistory } from './analytics.js';
 import { uploadMiddleware, handleUpload } from './upload.js';
+import { getMetaOAuthUrl, handleMetaCallback } from './meta.js';
 
 dotenv.config();
 
@@ -109,17 +110,9 @@ app.get('/api/analytics', authMiddleware, getAnalytics);
 app.post('/api/analytics/sync', authMiddleware, syncAnalytics);
 app.get('/api/analytics/history', authMiddleware, getAnalyticsHistory);
 
-// ----- Legacy Meta OAuth URL -----
-app.get('/api/meta/oauth-url', (req, res) => {
-  const redirectUri = `${process.env.APP_URL}/api/meta/callback`;
-  const scopes = 'pages_manage_posts,pages_read_engagement,instagram_basic,instagram_content_publish';
-  const url = `https://www.facebook.com/v18.0/dialog/oauth?` +
-    `client_id=${process.env.META_APP_ID}&` +
-    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
-    `scope=${encodeURIComponent(scopes)}&` +
-    `response_type=code`;
-  res.json({ url });
-});
+// ----- Meta OAuth -----
+app.get('/api/meta/oauth-url', authMiddleware, getMetaOAuthUrl);
+app.get('/api/meta/callback', handleMetaCallback);
 
 // ----- Root -----
 app.get('/', (req, res) => {
